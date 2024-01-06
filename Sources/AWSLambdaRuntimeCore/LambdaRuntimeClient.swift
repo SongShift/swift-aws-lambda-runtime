@@ -69,7 +69,17 @@ internal struct LambdaRuntimeClient {
             headers = LambdaRuntimeClient.defaultHeaders
         case .failure(let error):
             url += Consts.postErrorURLSuffix
-            let errorResponse = ErrorResponse(errorType: Consts.functionError, errorMessage: "\(error)")
+            
+            /*
+             If a LambdaError is thrown, we allow a custom errorType to be thrown from the function
+             */
+            var errorResponse: ErrorResponse
+            if let lambdaError = error as? LambdaError {
+                errorResponse = ErrorResponse(errorType: lambdaError.errorType, errorMessage: lambdaError.errorMessage)
+            } else {
+                errorResponse = ErrorResponse(errorType: Consts.functionError, errorMessage: "\(error)")
+            }
+            
             let bytes = errorResponse.toJSONBytes()
             body = self.allocator.buffer(capacity: bytes.count)
             body!.writeBytes(bytes)
