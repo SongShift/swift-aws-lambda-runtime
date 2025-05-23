@@ -255,7 +255,7 @@ extension LambdaHandler {
 /// unchecked sendable wrapper for the handler
 /// this is safe since lambda runtime is designed to calls the handler serially
 @usableFromInline
-internal struct UncheckedSendableHandler<Underlying: LambdaHandler, Event, Output>: @unchecked Sendable where Event == Underlying.Event, Output == Underlying.Output {
+struct UncheckedSendableHandler<Underlying: LambdaHandler, Event, Output>: @unchecked Sendable where Event == Underlying.Event, Output == Underlying.Output {
     @usableFromInline
     let underlying: Underlying
 
@@ -398,7 +398,7 @@ extension EventLoopLambdaHandler {
 /// - note: This is a low level protocol designed to power the higher level ``EventLoopLambdaHandler`` and
 ///         ``LambdaHandler`` based APIs.
 ///         Most users are not expected to use this protocol.
-public protocol ByteBufferLambdaHandler {
+public protocol ByteBufferLambdaHandler: LambdaRuntimeHandler {
     /// Create a Lambda handler for the runtime.
     ///
     /// Use this to initialize all your resources that you want to cache between invocations. This could be database
@@ -431,6 +431,28 @@ extension ByteBufferLambdaHandler {
     public static func main() {
         _ = Lambda.run(configuration: .init(), handlerType: Self.self)
     }
+}
+
+// MARK: - LambdaRuntimeHandler
+
+/// An `EventLoopFuture` based processing protocol for a Lambda that takes a `ByteBuffer` and returns
+/// an optional `ByteBuffer` asynchronously.
+///
+/// - note: This is a low level protocol designed to enable use cases where a frameworks initializes the
+///         runtime with a handler outside the normal initialization of
+///         ``ByteBufferLambdaHandler``, ``EventLoopLambdaHandler`` and ``LambdaHandler`` based APIs.
+///         Most users are not expected to use this protocol.
+public protocol LambdaRuntimeHandler {
+    /// The Lambda handling method.
+    /// Concrete Lambda handlers implement this method to provide the Lambda functionality.
+    ///
+    /// - parameters:
+    ///     - context: Runtime ``LambdaContext``.
+    ///     - event: The event or input payload encoded as `ByteBuffer`.
+    ///
+    /// - Returns: An `EventLoopFuture` to report the result of the Lambda back to the runtime engine.
+    ///            The `EventLoopFuture` should be completed with either a response encoded as `ByteBuffer` or an `Error`.
+    func handle(_ buffer: ByteBuffer, context: LambdaContext) -> EventLoopFuture<ByteBuffer?>
 }
 
 // MARK: - Other
