@@ -334,7 +334,17 @@ internal final class LambdaChannelHandler<Delegate: LambdaChannelHandlerDelegate
             self.reusableErrorBuffer!.clear()
         }
 
-        let errorResponse = ErrorResponse(errorType: Consts.functionError, errorMessage: "\(error)")
+        /*
+        If a LambdaError is thrown, we allow a custom errorType to be thrown from the function
+        */
+        var errorResponse: ErrorResponse
+        if let lambdaError = error as? LambdaError {
+            errorResponse = ErrorResponse(errorType: lambdaError.errorType, errorMessage: lambdaError.errorMessage)
+        } else {
+            errorResponse = ErrorResponse(errorType: Consts.functionError, errorMessage: "\(error)")
+        }
+                          
+        
         // TODO: Write this directly into our ByteBuffer
         let bytes = errorResponse.toJSONBytes()
         self.reusableErrorBuffer!.writeBytes(bytes)
