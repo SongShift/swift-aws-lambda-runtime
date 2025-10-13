@@ -7,7 +7,7 @@
 
 import Foundation
 
-public struct LambdaError: Error, Codable, Equatable {
+public struct LambdaError: Error, Codable, Equatable, Sendable {
     public let errorType: String
     public let errorMessage: String
     
