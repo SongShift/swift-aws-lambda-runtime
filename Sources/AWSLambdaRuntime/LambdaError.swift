@@ -7,12 +7,16 @@
 
 import Foundation
 
-public struct LambdaError: Error {
-    let errorType: String
-    let errorMessage: String
+public struct LambdaError: Error, Codable, Equatable {
+    public let errorType: String
+    public let errorMessage: String
     
     public init(errorType: String, errorMessage: String) {
         self.errorType = errorType
         self.errorMessage = errorMessage
+    }
+    
+    public static func == (lhs: LambdaError, rhs: LambdaError) -> Bool {
+        return lhs.errorType == rhs.errorType
     }
 }
