@@ -15,6 +15,7 @@
 #if LocalServerSupport
 import DequeModule
 import Dispatch
+import Foundation
 import Logging
 import NIOCore
 import NIOHTTP1
@@ -96,7 +97,7 @@ internal struct LambdaHTTPServer {
     private let invocationEndpoint: String
 
     private let invocationPool = Pool<LocalServerInvocation>()
-    private let responsePool = Pool<LocalServerResponse>()
+    private let responseRouter = ResponseRouter()
 
     private init(
         invocationEndpoint: String?
@@ -109,7 +110,7 @@ internal struct LambdaHTTPServer {
         case serverReturned(Swift.Result<Void, any Error>)
     }
 
-    fileprivate struct UnsafeTransferBox<Value>: @unchecked Sendable {
+    struct UnsafeTransferBox<Value>: @unchecked Sendable {
         let value: Value
 
         init(value: sending Value) {
@@ -272,7 +273,7 @@ internal struct LambdaHTTPServer {
 
                             // for streaming requests, push a partial head response
                             if self.isStreamingResponse(requestHead) {
-                                await self.responsePool.push(
+                                await self.responseRouter.deliver(
                                     LocalServerResponse(
                                         id: requestId,
                                         status: .ok
@@ -286,7 +287,7 @@ internal struct LambdaHTTPServer {
                             // if this is a request from a Streaming Lambda Handler,
                             // stream the response instead of buffering it
                             if self.isStreamingResponse(requestHead) {
-                                await self.responsePool.push(
+                                await self.responseRouter.deliver(
                                     LocalServerResponse(id: requestId, body: body)
                                 )
                             } else {
@@ -298,7 +299,7 @@ internal struct LambdaHTTPServer {
 
                             if self.isStreamingResponse(requestHead) {
                                 // for streaming response, send the final response
-                                await self.responsePool.push(
+                                await self.responseRouter.deliver(
                                     LocalServerResponse(id: requestId, final: true)
                                 )
                             } else {
@@ -392,30 +393,18 @@ internal struct LambdaHTTPServer {
             await self.invocationPool.push(LocalServerInvocation(requestId: requestId, request: body))
 
             // wait for the lambda function to process the request
-            for try await response in self.responsePool {
-                logger[metadataKey: "response requestId"] = "\(response.requestId ?? "nil")"
-                logger.trace("Received response to return to client")
-                if response.requestId == requestId {
-                    logger.trace("/invoke requestId is valid, sending the response")
-                    // send the response to the client
-                    // if the response is final, we can send it and return
-                    // if the response is not final, we can send it and wait for the next response
-                    try await self.sendResponse(response, outbound: outbound, logger: logger)
-                    if response.final == true {
-                        logger.trace("/invoke returning")
-                        return  // if the response is final, we can return and close the connection
-                    }
-                } else {
-                    logger.error(
-                        "Received response for a different request id",
-                        metadata: ["response requestId": "\(response.requestId ?? "")"]
-                    )
-                    // should we return an error here ? Or crash as this is probably a programming error?
+            logger.trace("/invoke waiting for response")
+            for try await response in self.responseRouter.waitForResponses(requestId: requestId) {
+                logger.trace("/invoke received response", metadata: ["final": "\(response.final)"])
+                // send the response to the client
+                // if the response is final, we can send it and return
+                // if the response is not final, we can send it and wait for the next response
+                try await self.sendResponse(response, outbound: outbound, logger: logger)
+                if response.final == true {
+                    logger.trace("/invoke returning")
+                    return  // if the response is final, we can return and close the connection
                 }
             }
-            // What todo when there is no more responses to process?
-            // This should not happen as the async iterator blocks until there is a response to process
-            fatalError("No more responses to process - the async for loop should not return")
 
         // client uses incorrect HTTP method
         case (_, let url) where url.hasSuffix(self.invocationEndpoint):
@@ -457,7 +446,7 @@ internal struct LambdaHTTPServer {
             }
             // enqueue the lambda function response to be served as response to the client /invoke
             logger.trace("/:requestId/response received response", metadata: ["requestId": "\(requestId)"])
-            await self.responsePool.push(
+            await self.responseRouter.deliver(
                 LocalServerResponse(
                     id: requestId,
                     status: .accepted,
@@ -488,7 +477,7 @@ internal struct LambdaHTTPServer {
             }
             // enqueue the lambda function response to be served as response to the client /invoke
             logger.trace("/:requestId/response received response", metadata: ["requestId": "\(requestId)"])
-            await self.responsePool.push(
+            await self.responseRouter.deliver(
                 LocalServerResponse(
                     id: requestId,
                     status: .internalServerError,
@@ -544,32 +533,143 @@ internal struct LambdaHTTPServer {
         }
     }
 
+    /// A router that delivers responses to the correct waiting request handler based on requestId.
+    /// This ensures that concurrent requests get their correct responses without cross-contamination.
+    internal final class ResponseRouter: Sendable {
+        private struct ResponseStream {
+            var buffer: Deque<LocalServerResponse> = []
+            var continuations: [UUID: CheckedContinuation<LocalServerResponse, any Error>] = [:]
+        }
+
+        private struct State {
+            var streams: [String: ResponseStream] = [:]
+        }
+
+        private let lock = Mutex<State>(State())
+
+        /// Deliver a response for a specific requestId
+        fileprivate func deliver(_ response: LocalServerResponse) async {
+            guard let requestId = response.requestId else {
+                return  // Ignore responses without a requestId
+            }
+
+            let maybeContinuation = self.lock.withLock { state -> CheckedContinuation<LocalServerResponse, any Error>? in
+                var stream = state.streams[requestId] ?? ResponseStream()
+
+                if let (id, continuation) = stream.continuations.first {
+                    stream.continuations.removeValue(forKey: id)
+                    // Update or remove the stream
+                    if stream.buffer.isEmpty && stream.continuations.isEmpty {
+                        state.streams.removeValue(forKey: requestId)
+                    } else {
+                        state.streams[requestId] = stream
+                    }
+                    return continuation
+                } else {
+                    stream.buffer.append(response)
+                    state.streams[requestId] = stream
+                    return nil
+                }
+            }
+
+            maybeContinuation?.resume(returning: response)
+        }
+
+        /// Wait for responses for a specific requestId. Returns an async sequence of responses.
+        fileprivate func waitForResponses(requestId: String) -> ResponseSequence {
+            ResponseSequence(router: self, requestId: requestId)
+        }
+
+        private func nextResponse(for requestId: String, waiterId: UUID) async throws -> LocalServerResponse? {
+            guard !Task.isCancelled else {
+                return nil
+            }
+
+            return try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<LocalServerResponse, any Error>) in
+                    let nextAction = self.lock.withLock { state -> LocalServerResponse? in
+                        var stream = state.streams[requestId] ?? ResponseStream()
+
+                        if let first = stream.buffer.popFirst() {
+                            // Update or remove the stream
+                            if stream.buffer.isEmpty && stream.continuations.isEmpty {
+                                state.streams.removeValue(forKey: requestId)
+                            } else {
+                                state.streams[requestId] = stream
+                            }
+                            return first
+                        } else {
+                            stream.continuations[waiterId] = continuation
+                            state.streams[requestId] = stream
+                            return nil
+                        }
+                    }
+
+                    guard let nextAction else { return }
+                    continuation.resume(returning: nextAction)
+                }
+            } onCancel: {
+                self.lock.withLock { state in
+                    if var stream = state.streams[requestId] {
+                        if let continuation = stream.continuations.removeValue(forKey: waiterId) {
+                            continuation.resume(throwing: CancellationError())
+                            // Clean up the stream if empty
+                            if stream.buffer.isEmpty && stream.continuations.isEmpty {
+                                state.streams.removeValue(forKey: requestId)
+                            } else {
+                                state.streams[requestId] = stream
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        fileprivate struct ResponseSequence: AsyncSequence {
+            typealias Element = LocalServerResponse
+
+            let router: ResponseRouter
+            let requestId: String
+
+            func makeAsyncIterator() -> ResponseIterator {
+                ResponseIterator(router: router, requestId: requestId)
+            }
+        }
+
+        fileprivate struct ResponseIterator: AsyncIteratorProtocol {
+            let router: ResponseRouter
+            let requestId: String
+            let id = UUID()
+
+            mutating func next() async throws -> LocalServerResponse? {
+                try await router.nextResponse(for: requestId, waiterId: id)
+            }
+        }
+    }
+
     /// A shared data structure to store the current invocation or response requests and the continuation objects.
     /// This data structure is shared between instances of the HTTPHandler
     /// (one instance to serve requests from the Lambda function and one instance to serve requests from the client invoking the lambda function).
     internal final class Pool<T>: AsyncSequence, AsyncIteratorProtocol, Sendable where T: Sendable {
         typealias Element = T
 
-        enum State: ~Copyable {
-            case buffer(Deque<T>)
-            case continuation(CheckedContinuation<T, any Error>?)
+        struct State {
+            var buffer: Deque<T> = []
+            var continuations: [UUID: CheckedContinuation<T, any Error>] = [:]
         }
 
-        private let lock = Mutex<State>(.buffer([]))
+        private let lock = Mutex<State>(State())
 
         /// enqueue an element, or give it back immediately to the iterator if it is waiting for an element
         public func push(_ invocation: T) async {
-            // if the iterator is waiting for an element, give it to it
+            // if there are any iterators waiting for an element, give it to one of them
             // otherwise, enqueue the element
             let maybeContinuation = self.lock.withLock { state -> CheckedContinuation<T, any Error>? in
-                switch consume state {
-                case .continuation(let continuation):
-                    state = .buffer([])
+                if let (id, continuation) = state.continuations.first {
+                    state.continuations.removeValue(forKey: id)
                     return continuation
-
-                case .buffer(var buffer):
-                    buffer.append(invocation)
-                    state = .buffer(buffer)
+                } else {
+                    state.buffer.append(invocation)
                     return nil
                 }
             }
@@ -583,21 +683,15 @@ internal struct LambdaHTTPServer {
                 return nil
             }
 
+            let id = UUID()
             return try await withTaskCancellationHandler {
                 try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<T, any Error>) in
                     let nextAction = self.lock.withLock { state -> T? in
-                        switch consume state {
-                        case .buffer(var buffer):
-                            if let first = buffer.popFirst() {
-                                state = .buffer(buffer)
-                                return first
-                            } else {
-                                state = .continuation(continuation)
-                                return nil
-                            }
-
-                        case .continuation:
-                            fatalError("Concurrent invocations to next(). This is illegal.")
+                        if let first = state.buffer.popFirst() {
+                            return first
+                        } else {
+                            state.continuations[id] = continuation
+                            return nil
                         }
                     }
 
@@ -607,12 +701,8 @@ internal struct LambdaHTTPServer {
                 }
             } onCancel: {
                 self.lock.withLock { state in
-                    switch consume state {
-                    case .buffer(let buffer):
-                        state = .buffer(buffer)
-                    case .continuation(let continuation):
-                        continuation?.resume(throwing: CancellationError())
-                        state = .buffer([])
+                    if let continuation = state.continuations.removeValue(forKey: id) {
+                        continuation.resume(throwing: CancellationError())
                     }
                 }
             }
@@ -623,7 +713,7 @@ internal struct LambdaHTTPServer {
         }
     }
 
-    private struct LocalServerResponse: Sendable {
+    fileprivate struct LocalServerResponse: Sendable {
         let requestId: String?
         let status: HTTPResponseStatus?
         let headers: HTTPHeaders?
